@@ -1,0 +1,69 @@
+
+#!groovy
+pipeline {
+  agent {label 'M3'}
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+    skipDefaultCheckout()
+    timeout(time: 2, unit: 'HOURS')
+  }
+  tools {
+    maven 'M3'
+  }
+  environment {
+    ARTIFACTORY = credentials('cdloyalty')
+  }
+  parameters {
+        choice(
+            choices: 'ars-automated-exceptions\nars-internet-redemptions\nars-astp\nars-batch-promotions\nars-customer-service\nars-easy-savingsz\nars-file-cache\nars-libcommons\nars-libredemption\nars-mqadapter\nars-system-maintenance\nars-webservices1\nars-webservices2',
+            description: 'select app',
+            name: 'REQUESTED_APP')
+        choice(
+            choices: 'master\ndevelop',
+            description: 'select checkout branch',
+            name: 'REQUESTED_BRANCH')
+        choice(
+            choices: 'SNAPSHOT\nRELEASE',
+            description: 'select version',
+            name: 'REQUESTED_VERSION')
+  }
+  
+  stages { 
+    stage('Checkout') {
+      steps {    
+        script {
+        def appMap = ['ars-automated-exceptions': 'https://somegitrepo.link.int/stash/scm/ars/ars-ae.git',
+                      'ars-internet-redemptions': 'https:/somegitrepo.link.int/stash/scm/ars/ars-ir.git',
+                      'ars-astp': 'https://somegitrepo.link.int/stash/scm/ars/ars-astp.git',
+                      'ars-batch-promotions': 'https://somegitrepo.link.int/stash/scm/ars/ars-batch-promotions.git',
+                      'ars-customer-service': 'https://somegitrepo.link.int/stash/scm/ars/ars-cs.git',
+                      'ars-easy-savingsz': 'https://somegitrepo.link.int/stash/scm/ars/ars-ezsavings.git',
+                      'ars-file-cache': 'https://somegitrepo.link.int/stash/scm/ars/ars-fc.git',
+                      'ars-libcommons': 'https://somegitrepo.link.int/stash/scm/ars/ars-lib-commons.git',
+                      'ars-libredemption': 'https://somegitrepo.link.int/stash/scm/ars/ars-lib-redemption.git',
+                      'ars-mqadapter': 'https://somegitrepo.link.int/stash/scm/ars/ars-mqadapter.git',
+                      'ars-system-maintenance': 'https://somegitrepo.link.int/stash/scm/ars/ars-sm.git',
+                      'ars-webservices1': 'https://somegitrepo.link.int/stash/scm/ars/ars-ws1.git',
+                      'ars-webservices2': 'https://somegitrepo.link.int/stash/scm/ars/ars-ws2.git'
+                     ]
+        def gitRepoURL = appMap["${REQUESTED_APP}"]
+        checkout([$class: 'GitSCM', credentialsId: 'cdloyalty', branches: [[name: "${params.REQUESTED_BRANCH}"]],userRemoteConfigs: [[url: "${gitRepoURL}"]]])
+        sh "ls -ltr"
+        }
+      }
+    }
+    stage('Publish Artifact') {
+      steps {
+        echo "Publishing ${REQUESTED_APP} Artifact from ${params.REQUESTED_BRANCH} branch"
+        sh "mvn -U clean install -Dminor-version=-${params.REQUESTED_VERSION} -Dmaven.test.skip=true" //change maven goal to deploy on acceptance
+      }
+    }
+  }
+  post {
+    always {
+      echo "Empty current workspace dir"
+      deleteDir()
+    }
+  }
+}
+
