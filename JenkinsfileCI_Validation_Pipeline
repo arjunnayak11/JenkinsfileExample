@@ -1,0 +1,325 @@
+     #!groovy
+pipeline {
+  agent {label 'JS'}
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+    skipDefaultCheckout()
+    timeout(time: 2, unit: 'HOURS')
+  }
+  environment {
+    BITBUCKET_API_DATA_FILE = 'bitbucket_api_data.json'
+    CUSTOM_LOG_FILE = 'momentumci.log'
+  }
+  tools {
+    maven 'M3'
+    jdk 'JDK 1.8'
+  }
+  stages {
+    stage ('Check Preconditions') {
+      when {
+        not {
+          anyOf {
+            environment name: 'CHANGE_TARGET', value: 'release'
+            environment name: 'CHANGE_TARGET', value: 'master'
+            environment name: 'CHANGE_TARGET', value: 'dev'
+            environment name: 'CHANGE_TARGET', value: 'develop'
+            environment name: 'CHANGE_TARGET', value: ''
+          }
+        }
+      }
+      steps {
+        echo "Abort Pipeline since this is a Pull Request with target branch as ${env.CHANGE_TARGET}"
+        script {
+          currentBuild.result = "ABORTED"
+        }
+        sh "exit 143"
+      } 
+    }
+    stage('Checkout') {
+      steps {
+        checkout scm
+        script {
+          env.LAST_COMMIT_HASH = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+          env.BITBUCKET_URL = sh(returnStdout: true, script: 'grep -m 1 "^[[:space:]]url.*" .git/config | grep -o "http.*"').trim()
+          env.RECIPIENTS = emailextrecipients([[$class: 'RequesterRecipientProvider'], [$class: 'DevelopersRecipientProvider']])
+          env.PR_DETAILS = " "
+          env.PR_REVIEWERS = " "
+          env.UNIT_TEST = "FAILED"
+          env.BUILD_ARTIFACT = "FAILED"
+          env.SOURCE_BRANCH_NAME = "${env.BRANCH_NAME}"
+          env.JOB_EXECUTION_DIR = "./"
+          env.GIT_REPO_NAME = sh(returnStdout: true, script: "echo ${env.BITBUCKET_URL} | python -c \"import sys, urlparse; print urlparse.urlparse(sys.stdin.read()).path\" | cut -d'/' -f5").trim()
+          if ( env.GIT_REPO_NAME == 'issuer-web-integration.git' | env.GIT_REPO_NAME == 'merchant-web-integration.git' | env.GIT_REPO_NAME == 'switch-admin-portal.git' | env.GIT_REPO_NAME == 'merchant-web-integration-legacy.git' | env.GIT_REPO_NAME == 'marketing-web-integration.git' ) {
+            script {
+              env.REPO_NAME = sh(returnStdout: true, script: "echo ${env.GIT_REPO_NAME} | cut -d'.' -f1").trim()
+            }
+          }
+          if ( env.GIT_REPO_NAME == 'masterpass.migration.ui.git' | env.GIT_REPO_NAME == 'masterpass.parent.ui.git' ) {
+            script {
+              env.REPO_NAME = sh(returnStdout: true, script: "echo ${env.GIT_REPO_NAME} | cut -d'.' -f-3").trim()
+            }
+          }
+        }
+        sh "touch ${env.CUSTOM_LOG_FILE}"
+        script {
+          // Todo: Remove this block of code once "Allow sending to unregistered users" is checked in the Global Configuration for Email Ext plugin
+          if ( ! env.CHANGE_TITLE ) {
+            // Get Bitbucket REST API Endpoint
+            env.GET_ENDPOINT_URL = sh(returnStdout: true, script: "grep -m 1 '^[[:space:]]url.*' .git/config | grep -o 'http.*' | sed 's@stash/scm/@stash/rest/api/1.0/projects/@' | sed 's@projects/~@users/@' | sed 's@\\([a-zA-Z0-9._-]*.git\\)@repos/\\1@' | sed 's@.git@/commits/${env.LAST_COMMIT_HASH}/?until=${env.SOURCE_BRANCH_NAME}@'").trim()
+            env.REST_API_ENDPOINT = "${env.GET_ENDPOINT_URL}"
+            withCredentials([usernameColonPassword(credentialsId: 'masterpass-to', variable: 'USERPASS')]) {
+              sh "curl -u $USERPASS -H 'Content-Type: application/json' ${env.REST_API_ENDPOINT} > ${env.BITBUCKET_API_DATA_FILE}"
+            }
+            // Parse all JSON Data from BitBucket API Request
+            env.RECIPIENTS = sh(returnStdout: true, script: "cat ${env.BITBUCKET_API_DATA_FILE} | python -c \"import sys, json; print json.load(sys.stdin)['committer']['emailAddress']\"").trim()
+          }
+        }
+        script {
+          // Identify the type of tool to pick for this repo's build based on the source code such as Maven, Node.js, etc.
+          // Maven job identification
+          if ( ! env.MAVEN_GOAL ) {
+            env.MAVEN_GOAL = "install"
+          }
+          pomFileLocation = "pom.xml"
+          if ( env.PATH_TO_POM_FILE ) {
+            pomFileLocation = "${env.PATH_TO_POM_FILE}/pom.xml"
+          }
+          if ( fileExists( pomFileLocation ) ) {
+            if ( env.PATH_TO_POM_FILE ) {
+              env.JOB_EXECUTION_DIR = env.PATH_TO_POM_FILE
+            }
+            env.IS_MAVEN_JOB = true
+          }
+          // Node.js job identification
+          if ( ! env.NODE_GOAL ) {
+            env.NODE_GOAL = "build"
+          }
+          packageFileLocation = "package.json"
+          if ( env.PATH_TO_PACKAGE_FILE ) {
+            packageFileLocation = "${env.PATH_TO_PACKAGE_FILE}/package.json"
+          }
+          if ( fileExists( packageFileLocation ) ) {
+            if ( env.PATH_TO_PACKAGE_FILE ) {
+              env.JOB_EXECUTION_DIR = env.PATH_TO_PACKAGE_FILE
+            }
+            env.IS_NODE_JOB = true
+            env.REPO_VERSION = sh(returnStdout: true, script: "cat package.json | python -c \"import sys, json; print json.load(sys.stdin)['version']\"").trim()
+          }
+        }
+      }
+    }
+    stage ('Check for Support by MomentumCI') {
+      when {
+        allOf {
+          environment name: 'IS_MAVEN_JOB', value: ''
+          environment name: 'IS_NODE_JOB', value: ''
+        }
+      }
+      steps {
+        echo "Abort Pipeline since the source code is not yet supported by MomentumCI"
+        script {
+          currentBuild.result = "ABORTED"
+        }
+        sh "exit 143"
+      } 
+    }
+    stage ('Get Pull Request Details') {
+      when {
+        not {
+          environment name: 'CHANGE_TITLE', value: ''
+        }
+      }
+      steps {
+        echo "Get all details related to the Pull Request"
+        script {
+          // Get Bitbucket REST API Endpoint
+          env.GET_ENDPOINT_URL = sh(returnStdout: true, script: "grep -m 1 '^[[:space:]]url.*' .git/config | grep -o 'http.*' | sed 's@stash/scm/@stash/rest/api/1.0/projects/@' | sed 's@projects/~@users/@' | sed 's@\\([a-zA-Z0-9._-]*.git\\)@repos/\\1@' | sed 's@.git@@'").trim()
+          env.GET_BRANCH_DETAILS = sh(returnStdout: true, script: 'grep -m 1 "^[[:space:]]fetch.*" .git/config | grep -o "+refs.*:" | sed "s/+refs//" | sed "s@/from@@" |  sed "s@:@@"').trim()
+          env.REST_API_ENDPOINT = "${env.GET_ENDPOINT_URL}${env.GET_BRANCH_DETAILS}"
+        }
+        withCredentials([usernameColonPassword(credentialsId: 'masterpass-to', variable: 'USERPASS')]) {
+          sh "curl -u $USERPASS -H 'Content-Type: application/json' ${env.REST_API_ENDPOINT} > ${env.BITBUCKET_API_DATA_FILE}"
+        }
+        script {
+          // Parse all JSON Data from BitBucket API Request
+          env.PR_REVIEWERS = sh(returnStdout: true, script: "cat ${env.BITBUCKET_API_DATA_FILE} | python -c \$'import sys, json\nfor item in json.load(sys.stdin)[\"reviewers\"]:print item[\"user\"][\"emailAddress\"]'").trim()
+          env.SOURCE_BRANCH_NAME = sh(returnStdout: true, script: "cat ${env.BITBUCKET_API_DATA_FILE} | python -c \"import sys, json; print json.load(sys.stdin)['fromRef']['displayId']\"").trim()
+          env.RECIPIENTS = sh(returnStdout: true, script: "cat ${env.BITBUCKET_API_DATA_FILE} | python -c \"import sys, json; print json.load(sys.stdin)['author']['user']['emailAddress']\"").trim()
+          env.PR_URL = sh(returnStdout: true, script: "echo ${env.CHANGE_URL} | sed 's/globalrepository.mclocal.int/dtl.fusion.proxy.mastercard.int/'").trim()
+          env.PR_DETAILS = "Pull Request Target : ${env.CHANGE_TARGET} \nPull Request Title : ${env.CHANGE_TITLE} \nPull Request Author : ${env.CHANGE_AUTHOR} \nPull Request URL : ${env.PR_URL} \n"
+        }
+      }
+    }
+    stage('Unit Tests') {
+      steps {
+        echo "Starting Unit Tests"
+        dir ( env.JOB_EXECUTION_DIR ) {
+          script {
+            if ( env.IS_MAVEN_JOB ) {
+              sh "set -o pipefail; mvn -U clean org.jacoco:jacoco-maven-plugin:prepare-agent test |& tee ${env.CUSTOM_LOG_FILE}"
+            }
+            if ( env.IS_NODE_JOB ) {
+                script {
+                  sh 'curl -s -o phantomjs-2.1.1.zip http://globalrepository.mclocal.int/artifactory/third-party/phantomjs/phantomjs/2.1.1/phantomjs-2.1.1.zip'
+                  sh 'unzip -o phantomjs-2.1.1.zip'
+                  sh 'mkdir -p bin'
+                  sh 'mv phantomjs-static bin/phantomjs'
+                }
+                withEnv(["PATH+NODEJS=${env.NODE6}/bin", "PATH+GULP=node_modules/.bin", "PATH+PHANTOMJS=${env.WORKSPACE}/bin"]) {
+                  sh "sed -i s/fusion.mastercard.com/globalrepository.mclocal.int/g package.json"
+                  sh 'npm install node-sass@4.7.2 --sass-binary-site=https://globalrepository.mclocal.int/artifactory/archive-external-release/node-sass'
+                  sh 'npm install'
+                  if ( env.REPO_NAME == 'issuer-web-integration' | env.REPO_NAME == 'merchant-web-integration' ) {
+                    script {
+                      sh "npm run test"
+                    }
+                  }
+                  if ( env.REPO_NAME == 'masterpass.migration.ui' |env.REPO_NAME == 'masterpass.parent.ui' ) {
+                    script {
+                      sh "npm run test-once"
+                    }
+                  }
+                  if ( env.REPO_NAME == 'switch-admin-portal' ) {
+                    script {
+                      sh "ng test --single-run --code-coverage"
+                    }
+                  }
+                  if ( env.REPO_NAME == 'merchant-web-integration-legacy' | env.REPO_NAME == 'marketing-web-integration' ) {
+                    echo "No Tests specified for the repository: ${env.REPO_NAME}"
+                  }
+                }
+            }
+          }
+        }
+        script {
+          env.UNIT_TEST = "PASSED"
+        } 
+      }
+    }
+    stage('SonarQube Static Code Analysis') {
+      when {
+        anyOf {
+          branch 'dev*'; branch 'master';
+        }
+      }
+      steps {
+        echo "Starting SonarQube static code analysis"
+        dir ( env.JOB_EXECUTION_DIR ) {
+          script {
+            if ( env.IS_MAVEN_JOB ) {
+              sh "set -o pipefail; mvn sonar:sonar |& tee ${env.CUSTOM_LOG_FILE}"
+            }
+            if ( env.IS_NODE_JOB ) {
+              if ( env.REPO_NAME == 'issuer-web-integration' ) {
+                withCredentials([usernamePassword(credentialsId: 'sonar-publisher', passwordVariable: 'SONAR_PASSWORD', usernameVariable: 'SONAR_USER')]) {
+                  sh """sonar-scanner -X -Dsonar.login=$SONAR_USER -Dsonar.password=$SONAR_PASSWORD -Dsonar.projectName="${env.REPO_NAME}" -Dsonar.projectVersion="${env.REPO_VERSION}" -Dsonar.projectKey="com.mastercard.masterpass:${env.REPO_NAME}" -Dsonar.branch="${env.BRANCH_NAME}" -Dsonar.language='js' -Dsonar.sources=src -Dsonar.tests=test -Dsonar.javascript.lcov.reportPath=report/coverage/**"""
+                }
+              }
+              if ( env.REPO_NAME == 'merchant-web-integration' ) {
+                withCredentials([usernamePassword(credentialsId: 'sonar-publisher', passwordVariable: 'SONAR_PASSWORD', usernameVariable: 'SONAR_USER')]) {
+                  sh """sonar-scanner -X -Dsonar.login=$SONAR_USER -Dsonar.password=$SONAR_PASSWORD -Dsonar.projectName="${env.REPO_NAME}" -Dsonar.projectVersion="${env.REPO_VERSION}" -Dsonar.projectKey="com.mastercard.masterpass:${env.REPO_NAME}" -Dsonar.branch="${env.BRANCH_NAME}" -Dsonar.language='js' -Dsonar.sources=src -Dsonar.tests=test -Dsonar.javascript.lcov.reportPath=coverage/lcov.info"""
+                }
+              }
+              if ( env.REPO_NAME == 'masterpass.migration.ui' | env.REPO_NAME == 'masterpass.parent.ui' ) {
+                withCredentials([usernamePassword(credentialsId: 'sonar-publisher', passwordVariable: 'SONAR_PASSWORD', usernameVariable: 'SONAR_USER')]) {
+                  sh """sonar-scanner -X -Dsonar.login=$SONAR_USER -Dsonar.password=$SONAR_PASSWORD -Dsonar.projectName="${env.REPO_NAME}" -Dsonar.projectVersion="${env.REPO_VERSION}" -Dsonar.projectKey="com.mastercard.masterpass:${env.REPO_NAME}" -Dsonar.branch="${env.BRANCH_NAME}" -Dsonar.language='js' -Dsonar.sources='.' -Dsonar.exclusions='node_modules/**, bin/**, client/bower_components/**'"""
+                }
+              }
+              if ( env.REPO_NAME == 'switch-admin-portal' ) {
+                withCredentials([usernamePassword(credentialsId: 'sonar-publisher', passwordVariable: 'SONAR_PASSWORD', usernameVariable: 'SONAR_USER')]) {
+                  sh """sonar-scanner -X -Dsonar.login=$SONAR_USER -Dsonar.password=$SONAR_PASSWORD -Dsonar.projectName="${env.REPO_NAME}" -Dsonar.projectVersion="${env.REPO_VERSION}" -Dsonar.projectKey="com.mastercard.masterpass:${env.REPO_NAME}" -Dsonar.branch="${env.BRANCH_NAME}" -Dsonar.language='js' -Dsonar.sources=src -Dsonar.javascript.lcov.reportPath=coverage/lcov.info"""
+                }
+              }
+              if ( env.REPO_NAME == 'merchant-web-integration-legacy' | env.REPO_NAME == 'marketing-web-integration' ) {
+                withCredentials([usernamePassword(credentialsId: 'sonar-publisher', passwordVariable: 'SONAR_PASSWORD', usernameVariable: 'SONAR_USER')]) {
+                  sh """sonar-scanner -X -Dsonar.login=$SONAR_USER -Dsonar.password=$SONAR_PASSWORD -Dsonar.projectName="${env.REPO_NAME}" -Dsonar.projectVersion="${env.REPO_VERSION}" -Dsonar.projectKey="com.mastercard.masterpass:${env.REPO_NAME}" -Dsonar.branch="${env.BRANCH_NAME}" -Dsonar.language='js' -Dsonar.sources=src"""
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    stage('Build Artifact') {
+      steps {
+        echo "Starting Build Artifact"
+        dir ( env.JOB_EXECUTION_DIR ) {
+          script {
+            if ( env.IS_MAVEN_JOB ) {
+              sh "set -o pipefail; mvn -U clean ${env.MAVEN_GOAL} -Dmaven.test.skip=true |& tee ${env.CUSTOM_LOG_FILE}"
+            }
+            if ( env.IS_NODE_JOB ) {
+              withEnv(["PATH+NODEJS=${env.NODE6}/bin", "PATH+GULP=node_modules/.bin", "PATH+PHANTOMJS=${env.WORKSPACE}/bin"]) {
+                if ( env.REPO_NAME == 'issuer-web-integration' | env.REPO_NAME == 'merchant-web-integration' ) {
+                  script {
+                    sh "npm run build -- --env=dev1"
+                  }
+                }
+                if ( env.REPO_NAME == 'masterpass.migration.ui' |env.REPO_NAME == 'masterpass.parent.ui' ) {
+                  script {
+                    sh "npm run build"
+                  }
+                }
+                if ( env.REPO_NAME == 'switch-admin-portal' ) {
+                  script {
+                    sh "ng build"
+                  }
+                }
+                if ( env.REPO_NAME == 'merchant-web-integration-legacy' | env.REPO_NAME == 'marketing-web-integration' ) {
+                  script {
+                    sh "gulp"
+                  }
+                }
+              }
+            }
+          }
+        }
+        script {
+          env.BUILD_ARTIFACT = "PASSED"
+        } 
+      }
+    }
+  }
+  post {
+    always {
+      script {
+        env.CUSTOM_LOG = sh(returnStdout: true, script: "tail -n 50 ${env.CUSTOM_LOG_FILE}").trim()
+      }
+      echo "Empty current workspace dir"
+      deleteDir()
+    }
+    failure {
+      emailext (
+        to: "${env.RECIPIENTS}",
+        subject: "BUILD FAILED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+        body: """
+Bitbucket URL: ${env.BITBUCKET_URL}
+Commit Hash: ${env.LAST_COMMIT_HASH}
+Branch Name: ${env.SOURCE_BRANCH_NAME}
+${env.PR_DETAILS}
+Unit Tests: ${env.UNIT_TEST}
+Build Artifact: ${env.BUILD_ARTIFACT}
+
+Jenkins Build URL: ${env.BUILD_URL}
+
+Build Log:
+${env.CUSTOM_LOG}""",
+      )
+    }
+    changed {
+      emailext (
+        to: "${env.PR_REVIEWERS}; ${env.RECIPIENTS}",
+        subject: "BUILD CHANGED: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'",
+        body: """
+Bitbucket URL: ${env.BITBUCKET_URL}
+Commit Hash: ${env.LAST_COMMIT_HASH}
+Branch Name: ${env.SOURCE_BRANCH_NAME}
+${env.PR_DETAILS}
+Unit Tests: ${env.UNIT_TEST}
+Build Artifact: ${env.BUILD_ARTIFACT}
+
+Jenkins Build URL: ${env.BUILD_URL}""",
+      )
+    }
+  }
+}
